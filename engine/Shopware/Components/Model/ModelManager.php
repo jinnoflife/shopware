@@ -30,6 +30,7 @@ use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Query\QueryBuilder as DBALQueryBuilder;
 use Doctrine\ORM\EntityManager;
 use Doctrine\ORM\Mapping\ClassMetadata;
+use Doctrine\ORM\Mapping\ClassMetadataInfo;
 use Doctrine\ORM\ORMException;
 use Doctrine\ORM\Proxy\Proxy;
 use Doctrine\ORM\Query;
@@ -115,12 +116,32 @@ class ModelManager extends EntityManager
         if ($entity instanceof \Traversable) {
             $entity = iterator_to_array($entity);
         }
-
         if (is_array($entity)) {
             return array_map([$this, 'serializeEntity'], $entity);
         }
 
         return $this->serializeEntity($entity);
+    }
+
+    /**
+     * @param int $maxDepth
+     * @param int $currentDepth
+     *
+     * @throws \Doctrine\Common\Persistence\Mapping\MappingException
+     * @throws \ReflectionException
+     *
+     * @return array
+     */
+    public function recursiveToArray($entity, $maxDepth = 1, $currentDepth = 0)
+    {
+        $map = [];
+        if (!is_object($entity) || $maxDepth < $currentDepth) {
+            return $map;
+        }
+        $map = $this->getForColumn($entity, $map);
+        $map = $this->getForAssociation($entity, $map, $maxDepth, $currentDepth);
+
+        return $map;
     }
 
     /**
@@ -210,11 +231,15 @@ class ModelManager extends EntityManager
         /** @var ClassMetadata $metaData */
         foreach ($allMetaData as $metaData) {
             $tableName = $metaData->getTableName();
+
             if (strpos($tableName, '_attributes') === false) {
                 continue;
             }
             if (!empty($tableNames) && !in_array($tableName, $tableNames, true)) {
                 continue;
+            }
+            if (strpos($tableName, 'grid')) {
+                Shopware()->PluginLogger()->info($tableName);
             }
             $attributeMetaData[] = $metaData;
         }
@@ -315,7 +340,6 @@ class ModelManager extends EntityManager
         if ($entity === null) {
             return [];
         }
-
         if ($entity instanceof Proxy) {
             /* @var Proxy $entity */
             $entity->__load();
@@ -325,11 +349,9 @@ class ModelManager extends EntityManager
         }
         $metadata = $this->getClassMetadata($className);
         $data = [];
-
         foreach ($metadata->fieldMappings as $field => $mapping) {
             $data[$field] = $metadata->reflFields[$field]->getValue($entity);
         }
-
         foreach ($metadata->associationMappings as $field => $mapping) {
             $key = Inflector::tableize($field);
             if ($mapping['isCascadeDetach']) {
@@ -351,5 +373,48 @@ class ModelManager extends EntityManager
         }
 
         return $data;
+    }
+
+    private function getForColumn($entity, $map)
+    {
+        foreach ($this->getClassMetadata(get_class($entity))->getColumnNames() as $name) {
+            $methodName = 'get' . ucfirst($name);
+            if (method_exists($entity, $methodName)) {
+                $map[$name] = $entity->$methodName();
+            }
+        }
+
+        return $map;
+    }
+
+    /**
+     * @throws \Doctrine\Common\Persistence\Mapping\MappingException
+     * @throws \ReflectionException
+     */
+    private function getForAssociation($entity, $map, $maxDepth, $currentDepth)
+    {
+        foreach ($this->getClassMetadata(get_class($entity))->getAssociationMappings() as $name => $mapping) {
+            $methodName = 'get' . ucfirst($name);
+            if (!method_exists($entity, $methodName)) {
+                continue;
+            }
+            if ($mapping['type'] === ClassMetadataInfo::MANY_TO_MANY) {
+                foreach ($entity->$methodName() as $subEntry) {
+                    $this->recursiveToArray($subEntry, $maxDepth, ($currentDepth + 1));
+                }
+            } elseif ($mapping['type'] === ClassMetadataInfo::ONE_TO_MANY) {
+                foreach ($entity->$methodName() as $subEntry) {
+                    $this->recursiveToArray($subEntry, $maxDepth, ($currentDepth + 1));
+                }
+            } else {
+                try {
+                    $map[$name] = $this->recursiveToArray($entity->$methodName(), $maxDepth, ($currentDepth + 1));
+                } catch (\ArgumentCountError $exception) {
+                    continue;
+                }
+            }
+        }
+
+        return $map;
     }
 }
